@@ -2,6 +2,7 @@ import os
 import re
 import sqlite3
 import random
+import requests
 from datetime import datetime, timedelta, time
 import pytz
 
@@ -11,6 +12,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 DB = "tracker.db"
 TOKEN = os.environ["BOT_TOKEN"]
+IG_USERNAME = os.environ.get("IG_USERNAME")
 
 # ---------- Attitude message pools ----------
 
@@ -52,10 +54,21 @@ EATING_CLOSED_REMINDERS = [
     "⛔ No more food. Stay sharp."
 ]
 
-DAILY_SUMMARY_MESSAGES = [
-    "📊 Day complete. You handled your business.",
-    "📊 Solid discipline today. Keep that standard.",
-    "📊 You showed up today. Respect."
+STORY_OK_MESSAGES = [
+    "📸 Story’s up. You showed your face. Respect.",
+    "📸 You posted a story. Accountability handled.",
+    "📸 Story detected. You did the work."
+]
+
+STORY_MISS_MESSAGES = [
+    "❌ No story today. You had the window. Don’t waste tomorrow.",
+    "❌ No story up. Discipline slipped. Fix it.",
+    "❌ You stayed silent today. That’s on you."
+]
+
+STORY_FAIL_MESSAGES = [
+    "⚠️ Couldn’t verify a story today. Handle it manually.",
+    "⚠️ Instagram didn’t cooperate. No excuses tomorrow."
 ]
 
 # ---------- DB helpers ----------
@@ -85,6 +98,44 @@ def ensure_user(user_id):
         cur.execute("INSERT INTO state (telegram_user_id) VALUES (?)", (user_id,))
         con.commit()
     con.close()
+
+# ---------- Instagram story check ----------
+
+def has_active_story(username):
+    """
+    Best-effort check for whether a public IG profile has an active story.
+    Returns:
+        True  -> story exists
+        False -> no story
+        None  -> could not determine
+    """
+    try:
+        url = f"https://www.instagram.com/{username}/"
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "en-US,en;q=0.9"
+        }
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return None
+
+        text = r.text
+
+        # Known indicators of active story ring
+        if '"has_public_story":true' in text:
+            return True
+
+        if '"has_public_story":false' in text:
+            return False
+
+        # Fallback heuristic (sometimes used)
+        if '"reel_ids":[' in text:
+            return True
+
+        return False
+
+    except Exception:
+        return None
 
 # ---------- Helpers ----------
 
@@ -145,3 +196,96 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_water(user_id, amount)
         await update.message.reply_text(f"💧 Logged {amount} ml.")
         return
+
+    if "start" in text and "eat" in text:
+        start_eating(user_id)
+        await update.message.reply_text("🍽️ Eating window started.")
+        return
+
+    if "stop" in text or "done" in text:
+        stop_eating(user_id)
+        await update.message.reply_text("⏳ Fasting started.")
+        return
+
+    if "status" in text:
+        con = db()
+        cur = con.cursor()
+        cur.execute(
+            "SELECT is_eating, last_meal_time FROM state WHERE telegram_user_id=?",
+            (user_id,)
+        )
+        is_eating, last_meal = cur.fetchone()
+        con.close()
+
+        if is_eating:
+            await update.message.reply_text("🍽️ You are currently eating.")
+        elif last_meal:
+            delta = utcnow() - datetime.fromisoformat(last_meal)
+            await update.message.reply_text(
+                f"⏳ Fasting for {delta.seconds//3600}h {(delta.seconds%3600)//60}m."
+            )
+        return
+
+# ---------- Reminder engine ----------
+
+async def reminder_tick(context):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT u.telegram_user_id, u.timezone, u.eating_start, u.eating_end,
+               s.is_eating, s.last_water_time, s.last_meal_time
+        FROM users u JOIN state s ON u.telegram_user_id = s.telegram_user_id
+    """)
+    rows = cur.fetchall()
+    con.close()
+
+    for uid, tz, es, ee, is_eating, last_water, last_meal in rows:
+        tzinfo = pytz.timezone(tz)
+        now = utcnow().replace(tzinfo=pytz.utc).astimezone(tzinfo)
+
+        # 💧 Water
+        if not last_water or utcnow() - datetime.fromisoformat(last_water) > timedelta(minutes=90):
+            await context.bot.send_message(uid, random.choice(WATER_REMINDERS))
+
+        # ⏳ Fasting
+        if not is_eating and last_meal:
+            delta = utcnow() - datetime.fromisoformat(last_meal)
+            if delta.seconds % (6 * 3600) < 60:
+                await context.bot.send_message(uid, random.choice(FASTING_REMINDERS))
+
+        # 🍽️ Eating window
+        start = datetime.combine(now.date(), parse_hhmm(es), tzinfo)
+        end = datetime.combine(now.date(), parse_hhmm(ee), tzinfo)
+
+        if abs((now - start).total_seconds()) < 60:
+            await context.bot.send_message(uid, random.choice(EATING_OPEN_REMINDERS))
+
+        if abs((now - (end - timedelta(minutes=30))).total_seconds()) < 60:
+            await context.bot.send_message(uid, random.choice(EATING_CLOSE_SOON_REMINDERS))
+
+        if abs((now - end).total_seconds()) < 60:
+            await context.bot.send_message(uid, random.choice(EATING_CLOSED_REMINDERS))
+
+            # 🔍 Instagram story accountability
+            if IG_USERNAME:
+                result = has_active_story(IG_USERNAME)
+                if result is True:
+                    await context.bot.send_message(uid, random.choice(STORY_OK_MESSAGES))
+                elif result is False:
+                    await context.bot.send_message(uid, random.choice(STORY_MISS_MESSAGES))
+                else:
+                    await context.bot.send_message(uid, random.choice(STORY_FAIL_MESSAGES))
+
+# ---------- Boot ----------
+
+if __name__ == "__main__":
+    ensure_tables()
+
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(reminder_tick, "interval", minutes=1, args=[app.bot])
+    scheduler.start()
+
+    app.run_polling()
