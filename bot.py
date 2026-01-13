@@ -15,7 +15,7 @@ DB = "tracker.db"
 TOKEN = os.environ["BOT_TOKEN"]
 
 # =========================
-# Attitude message pools
+# Message pools
 # =========================
 
 WATER_REMINDERS = [
@@ -57,20 +57,15 @@ EATING_CLOSED_REMINDERS = [
 ]
 
 STORY_OK_MESSAGES = [
-    "📸 Story’s up. You showed your face. Respect.",
-    "📸 You posted a story. Accountability handled.",
-    "📸 Story detected. You did the work."
+    "📸 Story’s up. You showed your face. Respect."
 ]
 
 STORY_MISS_MESSAGES = [
-    "❌ No story today. You had the window. Don’t waste tomorrow.",
-    "❌ No story up. Discipline slipped. Fix it.",
-    "❌ You stayed silent today. That’s on you."
+    "❌ No story today. You had the window. Don’t waste tomorrow."
 ]
 
 STORY_FAIL_MESSAGES = [
-    "⚠️ Couldn’t verify a story today. Handle it manually.",
-    "⚠️ Instagram didn’t cooperate. No excuses tomorrow."
+    "⚠️ Couldn’t verify a story today. Handle it manually."
 ]
 
 # =========================
@@ -83,7 +78,7 @@ def db():
 def utcnow():
     return datetime.utcnow()
 
-def ensure_tables_and_columns():
+def ensure_tables():
     con = db()
     cur = con.cursor()
 
@@ -99,14 +94,6 @@ def ensure_tables_and_columns():
         created_at TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        telegram_user_id INTEGER,
-        type TEXT,
-        amount_ml INTEGER,
-        timestamp TEXT
-    );
-
     CREATE TABLE IF NOT EXISTS state (
         telegram_user_id INTEGER PRIMARY KEY,
         is_eating INTEGER DEFAULT 0,
@@ -116,17 +103,11 @@ def ensure_tables_and_columns():
     );
     """)
 
-    # Defensive migrations
     for col in ["ig_username", "ig_enabled"]:
         try:
             cur.execute(f"ALTER TABLE users ADD COLUMN {col}")
         except Exception:
             pass
-
-    try:
-        cur.execute("ALTER TABLE state ADD COLUMN last_water_reminder_time TEXT")
-    except Exception:
-        pass
 
     con.commit()
     con.close()
@@ -145,28 +126,30 @@ def ensure_user(user_id):
     con.close()
 
 # =========================
-# Instagram logic
+# Instagram helpers
 # =========================
+
+def instagram_username_valid(username):
+    try:
+        url = f"https://www.instagram.com/{username}/"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=10)
+        return r.status_code == 200
+    except Exception:
+        return False
 
 def has_active_story(username):
     try:
         url = f"https://www.instagram.com/{username}/"
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept-Language": "en-US,en;q=0.9"
-        }
+        headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code != 200:
             return None
-
         text = r.text
-        if '"has_public_story":true' in text:
+        if '"has_public_story":true' in text or '"reel_ids":[' in text:
             return True
         if '"has_public_story":false' in text:
             return False
-        if '"reel_ids":[' in text:
-            return True
-
         return False
     except Exception:
         return None
@@ -190,44 +173,23 @@ def parse_hhmm(val):
 # Core actions
 # =========================
 
-def log_event(user_id, type_, amount=None):
-    con = db()
-    con.execute(
-        "INSERT INTO events (telegram_user_id, type, amount_ml, timestamp) VALUES (?, ?, ?, ?)",
-        (user_id, type_, amount, utcnow().isoformat())
-    )
-    con.commit()
-    con.close()
-
 def start_eating(user_id):
-    log_event(user_id, "EAT_START")
-    con = db()
-    con.execute(
+    db().execute(
         "UPDATE state SET is_eating=1, last_meal_time=? WHERE telegram_user_id=?",
         (utcnow().isoformat(), user_id)
-    )
-    con.commit()
-    con.close()
+    ).connection.commit()
 
 def stop_eating(user_id):
-    log_event(user_id, "EAT_STOP")
-    con = db()
-    con.execute(
+    db().execute(
         "UPDATE state SET is_eating=0 WHERE telegram_user_id=?",
         (user_id,)
-    )
-    con.commit()
-    con.close()
+    ).connection.commit()
 
 def log_water(user_id, amount):
-    log_event(user_id, "WATER", amount)
-    con = db()
-    con.execute(
+    db().execute(
         "UPDATE state SET last_water_time=?, last_water_reminder_time=NULL WHERE telegram_user_id=?",
         (utcnow().isoformat(), user_id)
-    )
-    con.commit()
-    con.close()
+    ).connection.commit()
 
 # =========================
 # Message handler
@@ -235,27 +197,40 @@ def log_water(user_id, amount):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = update.message.text.lower()
+    text = update.message.text.strip()
+    text_l = text.lower()
+
     ensure_user(user_id)
 
-    if text.startswith("set instagram"):
+    # ----- Instagram commands -----
+
+    if text_l.startswith("set instagram"):
         username = text.split()[-1].lstrip("@")
-        db().execute(
-            "UPDATE users SET ig_username=? WHERE telegram_user_id=?",
-            (username, user_id)
-        ).connection.commit()
-        await update.message.reply_text(f"📸 Instagram set to @{username}.")
+        if instagram_username_valid(username):
+            db().execute(
+                "UPDATE users SET ig_username=? WHERE telegram_user_id=?",
+                (username, user_id)
+            ).connection.commit()
+            await update.message.reply_text(f"📸 Instagram verified: @{username}")
+        else:
+            await update.message.reply_text("❌ Instagram account not found or not public.")
         return
 
-    if text == "instagram on":
-        db().execute(
-            "UPDATE users SET ig_enabled=1 WHERE telegram_user_id=?",
-            (user_id,)
-        ).connection.commit()
-        await update.message.reply_text("📸 Instagram checks ON.")
+    if text_l == "instagram on":
+        cur = db().cursor()
+        cur.execute("SELECT ig_username FROM users WHERE telegram_user_id=?", (user_id,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            await update.message.reply_text("❌ Set a public Instagram username first.")
+        else:
+            db().execute(
+                "UPDATE users SET ig_enabled=1 WHERE telegram_user_id=?",
+                (user_id,)
+            ).connection.commit()
+            await update.message.reply_text(f"📸 Instagram checks ON for @{row[0]}")
         return
 
-    if text == "instagram off":
+    if text_l == "instagram off":
         db().execute(
             "UPDATE users SET ig_enabled=0 WHERE telegram_user_id=?",
             (user_id,)
@@ -263,18 +238,106 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📸 Instagram checks OFF.")
         return
 
-    if text == "instagram status":
+    # ----- Status -----
+
+    if text_l == "status":
         cur = db().cursor()
-        cur.execute(
-            "SELECT ig_enabled, ig_username FROM users WHERE telegram_user_id=?",
-            (user_id,)
+        cur.execute("""
+            SELECT s.is_eating, s.last_meal_time, u.ig_enabled, u.ig_username
+            FROM state s JOIN users u ON s.telegram_user_id = u.telegram_user_id
+            WHERE s.telegram_user_id=?
+        """, (user_id,))
+        is_eating, last_meal, ig_enabled, ig_username = cur.fetchone()
+
+        msg = []
+        msg.append("🍽️ Eating" if is_eating else "⏳ Fasting")
+
+        if last_meal:
+            delta = utcnow() - datetime.fromisoformat(last_meal)
+            msg.append(f"⏳ Fasted: {delta.seconds//3600}h {(delta.seconds%3600)//60}m")
+
+        msg.append(
+            f"📸 Instagram: {'ON' if ig_enabled else 'OFF'}"
+            + (f" (@{ig_username})" if ig_username else "")
         )
-        enabled, username = cur.fetchone()
-        await update.message.reply_text(
-            f"📸 Instagram: {'ON' if enabled else 'OFF'}\n"
-            f"Username: @{username if username else 'not set'}"
-        )
+
+        await update.message.reply_text("\n".join(msg))
         return
 
-    if "water" in text:
-        amount = int(r
+    # ----- Core actions -----
+
+    if "water" in text_l:
+        amount = int(re.findall(r"\d+", text)[0]) if re.findall(r"\d+", text) else 250
+        log_water(user_id, amount)
+        await update.message.reply_text(f"💧 Logged {amount} ml.")
+        return
+
+    if "start" in text_l and "eat" in text_l:
+        start_eating(user_id)
+        await update.message.reply_text("🍽️ Eating window started.")
+        return
+
+    if "stop" in text_l or "done" in text_l:
+        stop_eating(user_id)
+        await update.message.reply_text("⏳ Fasting started.")
+        return
+
+# =========================
+# Reminder engine
+# =========================
+
+async def reminder_tick(context):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT u.telegram_user_id, u.timezone, u.eating_start, u.eating_end,
+               u.ig_enabled, u.ig_username,
+               s.is_eating, s.last_water_time, s.last_water_reminder_time, s.last_meal_time
+        FROM users u JOIN state s ON u.telegram_user_id = s.telegram_user_id
+    """)
+    rows = cur.fetchall()
+    con.close()
+
+    for uid, tz, es, ee, ig_enabled, ig_username, is_eating, last_water, last_reminder, last_meal in rows:
+        tzinfo = pytz.timezone(tz)
+        now = utcnow().replace(tzinfo=pytz.utc).astimezone(tzinfo)
+
+        # Water reminders (stateful)
+        if last_water:
+            since = utcnow() - datetime.fromisoformat(last_water)
+            if since > timedelta(minutes=90):
+                if not last_reminder or utcnow() - datetime.fromisoformat(last_reminder) > timedelta(minutes=90):
+                    await context.bot.send_message(uid, random.choice(WATER_REMINDERS))
+                    db().execute(
+                        "UPDATE state SET last_water_reminder_time=? WHERE telegram_user_id=?",
+                        (utcnow().isoformat(), uid)
+                    ).connection.commit()
+
+        # Eating window close + Instagram
+        end = datetime.combine(now.date(), parse_hhmm(ee), tzinfo)
+        if abs((now - end).total_seconds()) < 60:
+            await context.bot.send_message(uid, random.choice(EATING_CLOSED_REMINDERS))
+            if ig_enabled and ig_username:
+                result = await has_active_story_with_retry(ig_username)
+                if result is True:
+                    await context.bot.send_message(uid, random.choice(STORY_OK_MESSAGES))
+                elif result is False:
+                    await context.bot.send_message(uid, random.choice(STORY_MISS_MESSAGES))
+                else:
+                    await context.bot.send_message(uid, random.choice(STORY_FAIL_MESSAGES))
+
+# =========================
+# Boot
+# =========================
+
+if __name__ == "__main__":
+    ensure_tables()
+
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(reminder_tick, "interval", minutes=1)
+    scheduler.start()
+
+    app.run_polling()
