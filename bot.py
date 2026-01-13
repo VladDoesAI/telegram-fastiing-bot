@@ -2,6 +2,7 @@ import os
 import re
 import sqlite3
 import random
+import asyncio
 import requests
 from datetime import datetime, timedelta, time
 import pytz
@@ -12,9 +13,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 DB = "tracker.db"
 TOKEN = os.environ["BOT_TOKEN"]
-IG_USERNAME = os.environ.get("IG_USERNAME")
 
-# ---------- Attitude message pools ----------
+# =========================
+# Attitude message pools
+# =========================
 
 WATER_REMINDERS = [
     "💧 Drink some water. I pity the fool who ignores hydration.",
@@ -71,7 +73,9 @@ STORY_FAIL_MESSAGES = [
     "⚠️ Instagram didn’t cooperate. No excuses tomorrow."
 ]
 
-# ---------- DB helpers ----------
+# =========================
+# DB helpers
+# =========================
 
 def db():
     return sqlite3.connect(DB, check_same_thread=False)
@@ -79,10 +83,51 @@ def db():
 def utcnow():
     return datetime.utcnow()
 
-def ensure_tables():
+def ensure_tables_and_columns():
     con = db()
     cur = con.cursor()
-    cur.executescript(open("schema.sql").read())
+
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        telegram_user_id INTEGER PRIMARY KEY,
+        timezone TEXT DEFAULT 'UTC',
+        eating_start TEXT DEFAULT '12:00',
+        eating_end TEXT DEFAULT '20:00',
+        water_goal_ml INTEGER DEFAULT 3000,
+        ig_username TEXT,
+        ig_enabled INTEGER DEFAULT 0,
+        created_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_user_id INTEGER,
+        type TEXT,
+        amount_ml INTEGER,
+        timestamp TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS state (
+        telegram_user_id INTEGER PRIMARY KEY,
+        is_eating INTEGER DEFAULT 0,
+        last_meal_time TEXT,
+        last_water_time TEXT,
+        last_water_reminder_time TEXT
+    );
+    """)
+
+    # Defensive migrations
+    for col in ["ig_username", "ig_enabled"]:
+        try:
+            cur.execute(f"ALTER TABLE users ADD COLUMN {col}")
+        except Exception:
+            pass
+
+    try:
+        cur.execute("ALTER TABLE state ADD COLUMN last_water_reminder_time TEXT")
+    except Exception:
+        pass
+
     con.commit()
     con.close()
 
@@ -99,16 +144,11 @@ def ensure_user(user_id):
         con.commit()
     con.close()
 
-# ---------- Instagram story check ----------
+# =========================
+# Instagram logic
+# =========================
 
 def has_active_story(username):
-    """
-    Best-effort check for whether a public IG profile has an active story.
-    Returns:
-        True  -> story exists
-        False -> no story
-        None  -> could not determine
-    """
     try:
         url = f"https://www.instagram.com/{username}/"
         headers = {
@@ -120,30 +160,35 @@ def has_active_story(username):
             return None
 
         text = r.text
-
-        # Known indicators of active story ring
         if '"has_public_story":true' in text:
             return True
-
         if '"has_public_story":false' in text:
             return False
-
-        # Fallback heuristic (sometimes used)
         if '"reel_ids":[' in text:
             return True
 
         return False
-
     except Exception:
         return None
 
-# ---------- Helpers ----------
+async def has_active_story_with_retry(username):
+    first = has_active_story(username)
+    if first is not None:
+        return first
+    await asyncio.sleep(5)
+    return has_active_story(username)
+
+# =========================
+# Helpers
+# =========================
 
 def parse_hhmm(val):
     h, m = val.split(":")
     return time(int(h), int(m))
 
-# ---------- Core actions ----------
+# =========================
+# Core actions
+# =========================
 
 def log_event(user_id, type_, amount=None):
     con = db()
@@ -178,114 +223,58 @@ def log_water(user_id, amount):
     log_event(user_id, "WATER", amount)
     con = db()
     con.execute(
-        "UPDATE state SET last_water_time=? WHERE telegram_user_id=?",
+        "UPDATE state SET last_water_time=?, last_water_reminder_time=NULL WHERE telegram_user_id=?",
         (utcnow().isoformat(), user_id)
     )
     con.commit()
     con.close()
 
-# ---------- Message handler ----------
+# =========================
+# Message handler
+# =========================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.lower()
     ensure_user(user_id)
 
-    if "water" in text:
-        amount = int(re.findall(r"\d+", text)[0]) if re.findall(r"\d+", text) else 250
-        log_water(user_id, amount)
-        await update.message.reply_text(f"💧 Logged {amount} ml.")
+    if text.startswith("set instagram"):
+        username = text.split()[-1].lstrip("@")
+        db().execute(
+            "UPDATE users SET ig_username=? WHERE telegram_user_id=?",
+            (username, user_id)
+        ).connection.commit()
+        await update.message.reply_text(f"📸 Instagram set to @{username}.")
         return
 
-    if "start" in text and "eat" in text:
-        start_eating(user_id)
-        await update.message.reply_text("🍽️ Eating window started.")
+    if text == "instagram on":
+        db().execute(
+            "UPDATE users SET ig_enabled=1 WHERE telegram_user_id=?",
+            (user_id,)
+        ).connection.commit()
+        await update.message.reply_text("📸 Instagram checks ON.")
         return
 
-    if "stop" in text or "done" in text:
-        stop_eating(user_id)
-        await update.message.reply_text("⏳ Fasting started.")
+    if text == "instagram off":
+        db().execute(
+            "UPDATE users SET ig_enabled=0 WHERE telegram_user_id=?",
+            (user_id,)
+        ).connection.commit()
+        await update.message.reply_text("📸 Instagram checks OFF.")
         return
 
-    if "status" in text:
-        con = db()
-        cur = con.cursor()
+    if text == "instagram status":
+        cur = db().cursor()
         cur.execute(
-            "SELECT is_eating, last_meal_time FROM state WHERE telegram_user_id=?",
+            "SELECT ig_enabled, ig_username FROM users WHERE telegram_user_id=?",
             (user_id,)
         )
-        is_eating, last_meal = cur.fetchone()
-        con.close()
-
-        if is_eating:
-            await update.message.reply_text("🍽️ You are currently eating.")
-        elif last_meal:
-            delta = utcnow() - datetime.fromisoformat(last_meal)
-            await update.message.reply_text(
-                f"⏳ Fasting for {delta.seconds//3600}h {(delta.seconds%3600)//60}m."
-            )
+        enabled, username = cur.fetchone()
+        await update.message.reply_text(
+            f"📸 Instagram: {'ON' if enabled else 'OFF'}\n"
+            f"Username: @{username if username else 'not set'}"
+        )
         return
 
-# ---------- Reminder engine ----------
-
-async def reminder_tick(context):
-    con = db()
-    cur = con.cursor()
-    cur.execute("""
-        SELECT u.telegram_user_id, u.timezone, u.eating_start, u.eating_end,
-               s.is_eating, s.last_water_time, s.last_meal_time
-        FROM users u JOIN state s ON u.telegram_user_id = s.telegram_user_id
-    """)
-    rows = cur.fetchall()
-    con.close()
-
-    for uid, tz, es, ee, is_eating, last_water, last_meal in rows:
-        tzinfo = pytz.timezone(tz)
-        now = utcnow().replace(tzinfo=pytz.utc).astimezone(tzinfo)
-
-        # 💧 Water
-        if not last_water or utcnow() - datetime.fromisoformat(last_water) > timedelta(minutes=90):
-            await context.bot.send_message(uid, random.choice(WATER_REMINDERS))
-
-        # ⏳ Fasting
-        if not is_eating and last_meal:
-            delta = utcnow() - datetime.fromisoformat(last_meal)
-            if delta.seconds % (6 * 3600) < 60:
-                await context.bot.send_message(uid, random.choice(FASTING_REMINDERS))
-
-        # 🍽️ Eating window
-        start = datetime.combine(now.date(), parse_hhmm(es), tzinfo)
-        end = datetime.combine(now.date(), parse_hhmm(ee), tzinfo)
-
-        if abs((now - start).total_seconds()) < 60:
-            await context.bot.send_message(uid, random.choice(EATING_OPEN_REMINDERS))
-
-        if abs((now - (end - timedelta(minutes=30))).total_seconds()) < 60:
-            await context.bot.send_message(uid, random.choice(EATING_CLOSE_SOON_REMINDERS))
-
-        if abs((now - end).total_seconds()) < 60:
-            await context.bot.send_message(uid, random.choice(EATING_CLOSED_REMINDERS))
-
-            # 🔍 Instagram story accountability
-            if IG_USERNAME:
-                result = has_active_story(IG_USERNAME)
-                if result is True:
-                    await context.bot.send_message(uid, random.choice(STORY_OK_MESSAGES))
-                elif result is False:
-                    await context.bot.send_message(uid, random.choice(STORY_MISS_MESSAGES))
-                else:
-                    await context.bot.send_message(uid, random.choice(STORY_FAIL_MESSAGES))
-
-# ---------- Boot ----------
-
-if __name__ == "__main__":
-    ensure_tables()
-
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(reminder_tick, "interval", minutes=1, args=[app.bot])
-    scheduler.start()
-
-    app.run_polling()
+    if "water" in text:
+        amount = int(r
